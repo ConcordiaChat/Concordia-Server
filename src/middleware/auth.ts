@@ -1,53 +1,68 @@
 import { Request, Response, NextFunction } from 'express';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 export interface AuthRequest extends Request {
   user?: { id: string; username: string; avatar_url: string | null };
 }
 
 // ── Federation token verification ─────────────────────────────────────────────
-// The server does NOT hold any JWT secret. It verifies every token by calling
-// the Federation's /api/user/me endpoint and caches the result for CACHE_TTL_MS
-// to avoid a round-trip on every single request.
+// The server holds NO secrets. It verifies server-scoped tokens locally
+// against the Federation's published JWKS (EdDSA public keys) and accepts
+// only tokens whose `aud` claim is this server's own public origin.
+//
+// This means:
+//  - a token minted for another server is useless here (wrong audience)
+//  - a user's Federation identity token is useless here (federation audience)
+//  - no round-trip to the Federation on the request path — jose caches the
+//    JWKS and refetches on unknown-kid (i.e. key rotation) automatically.
 
 const FEDERATION_URL =
   process.env.FEDERATION_URL || 'https://federation.concordiachat.com';
 
-const CACHE_TTL_MS = 60_000; // 1 minute
-
-interface CacheEntry {
-  user: { id: string; username: string; avatar_url: string | null };
-  expiresAt: number;
+/** Canonical origin form shared with the Federation's audience normalizer. */
+function normalizeOrigin(input: string): string {
+  const withScheme = /^https?:\/\//i.test(input) ? input : `https://${input}`;
+  return new URL(withScheme).origin.toLowerCase();
 }
 
-const tokenCache = new Map<string, CacheEntry>();
+const FEDERATION_ORIGIN = normalizeOrigin(FEDERATION_URL);
+
+// This server's own public origin — the `aud` value it accepts. Required in
+// production; falls back to localhost:PORT for local development.
+const SERVER_PUBLIC_ORIGIN = normalizeOrigin(
+  process.env.SERVER_PUBLIC_ORIGIN ||
+    `http://localhost:${process.env.PORT || 3001}`,
+);
+
+if (!process.env.SERVER_PUBLIC_ORIGIN) {
+  console.warn(
+    `[auth] SERVER_PUBLIC_ORIGIN not set — accepting tokens for ${SERVER_PUBLIC_ORIGIN}. ` +
+      'Set it to this server\'s public URL in production.',
+  );
+}
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${FEDERATION_ORIGIN}/.well-known/jwks.json`),
+  { cooldownDuration: 30_000, cacheMaxAge: 600_000 },
+);
 
 export async function verifyFederationToken(
   token: string,
 ): Promise<{ id: string; username: string; avatar_url: string | null } | null> {
-  const cached = tokenCache.get(token);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.user;
-  }
-
   try {
-    const res = await fetch(`${FEDERATION_URL}/api/user/me`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(5_000),
+    const { payload } = await jwtVerify(token, JWKS, {
+      algorithms: ['EdDSA'],
+      audience: SERVER_PUBLIC_ORIGIN,
+      issuer: FEDERATION_ORIGIN,
     });
 
-    if (!res.ok) {
-      tokenCache.delete(token);
-      return null;
-    }
+    if (!payload.sub) return null;
 
-    const data = (await res.json()) as { user: { id: string; username: string; avatar_url?: string | null } };
-    const user = {
-      id: data.user.id,
-      username: data.user.username,
-      avatar_url: data.user.avatar_url ?? null,
+    return {
+      id: payload.sub,
+      username: (payload.preferred_username as string | null) ?? payload.sub,
+      avatar_url: (payload.avatar_url as string | null) ?? null,
     };
-    tokenCache.set(token, { user, expiresAt: Date.now() + CACHE_TTL_MS });
-    return user;
   } catch {
     return null;
   }

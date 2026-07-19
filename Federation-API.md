@@ -1,6 +1,6 @@
 ﻿# Concordia Federation — API Reference
 
-> Last updated: March 7, 2026 6:10 PM PST
+> Last updated: July 19, 2026
 
 > The Federation is the sole authentication and settings authority for all Concordia clients.
 > Individual servers never receive personal user data — only the user's `id`.
@@ -11,11 +11,43 @@ All request and response bodies are JSON.
 
 ### Authentication
 
-All protected endpoints require a JWT in the `Authorization` header:
+The Federation issues **EdDSA (Ed25519) signed JWTs**. Public verification keys
+are published at `GET /.well-known/jwks.json` — services verify tokens locally;
+there are no shared signing secrets anywhere in the platform.
+
+Two token types exist, distinguished by their `aud` (audience) claim:
+
+| Token | `aud` | Lifetime | Sent to |
+|---|---|---|---|
+| **Identity token** | `concordia:federation`, `concordia:social` | `JWT_EXPIRES_IN` (default `7d`) | Federation + Social only |
+| **Server token** | the chat server's origin, e.g. `https://chat.example.com` | `SERVER_TOKEN_TTL` (default 600 s) | that one chat server only |
+
+All protected Federation endpoints require an **identity token** in the `Authorization` header:
 ```
-Authorization: Bearer <token>
+Authorization: Bearer <identity token>
 ```
-Tokens are issued by `/api/auth/register` and `/api/auth/login`. They expire after the duration set in `JWT_EXPIRES_IN` (default `7d`).
+Identity tokens are issued by `/api/auth/register` and `/api/auth/login`.
+
+> ⚠️ **Never send the identity token to a chat server.** Exchange it for a
+> short-lived server-scoped token via [`POST /api/auth/server-token`](#post-apiauthserver-token)
+> and send only that. Chat servers reject any token whose `aud` is not their own
+> origin, and the Federation and Social reject server-scoped tokens — so a token
+> harvested by a malicious server operator is useless anywhere else and expires
+> within minutes.
+
+### Signing keys
+
+### `GET /.well-known/jwks.json`
+
+Public JWKS document (RFC 7517). Chat servers and Social verify Federation-issued
+tokens against these keys locally (`alg: EdDSA`). Responses are cacheable
+(`Cache-Control: public, max-age=300`); key rotation adds a new `kid` while
+tokens signed by the old key finish expiring.
+
+**Response `200`**
+```json
+{ "keys": [ { "kty": "OKP", "crv": "Ed25519", "x": "…", "kid": "…", "alg": "EdDSA", "use": "sig" } ] }
+```
 
 ### WebSocket Connection
 
@@ -104,6 +136,89 @@ Authenticates an existing user. Returns a JWT.
 
 > The same `401` message is returned for both unknown email and wrong password to prevent user enumeration.
 
+### `POST /api/auth/server-token`
+
+🔒 Requires identity token.
+
+Exchanges the caller's identity token for a **short-lived token scoped to one
+chat server** (OAuth-style token exchange). The token's `aud` claim is the
+normalized origin of the requested server; the server verifies it locally
+against the Federation JWKS and rejects tokens minted for anyone else.
+
+The token also embeds `preferred_username` and `avatar_url` claims so servers
+can render the member without calling the Federation.
+
+**Request body**
+
+| Field | Type | Rules |
+|-------|------|-------|
+| `server` | string | The server's address (`https://chat.example.com`, bare hosts assume `https`) |
+
+**`200 OK`**
+```json
+{
+  "token": "<server-scoped jwt>",
+  "audience": "https://chat.example.com",
+  "expires_in": 600
+}
+```
+
+**`400`** Invalid server address · **`401`** Missing/invalid identity token · **`500`** Server error
+
+> Clients should cache the token per server and refresh shortly before
+> `expires_in` elapses (the reference client refreshes 60 s early).
+
+### `POST /api/auth/refresh`
+
+Rotating refresh. Body: `{ "refresh_token": "<token>" }` → `200` with a fresh
+`{ token, refresh_token, expires_in }` pair. The presented token is revoked on
+use; **presenting an already-rotated token revokes every refresh token on the
+account** (stolen-token defense) → `401 "Session revoked."`.
+
+### `POST /api/auth/logout`
+
+🔒 Requires identity token. Optional body: `{ "refresh_token": "<token>" }`.
+Blacklists the identity token's `jti` (immediately invalid on every service)
+and revokes the refresh token.
+
+### Email verification
+
+- `POST /api/auth/verify-email/request` 🔒 — sends a one-time 24 h link
+  (page: `/account/verify-email.html`). Rate limit: 5/h per IP.
+- `POST /api/auth/verify-email/confirm` — body `{ token }` → marks the email
+  verified. Links are single-use.
+
+### Password reset
+
+- `POST /api/auth/password-reset/request` — body `{ email }`. **Always `200`**
+  (no user enumeration); if the account exists, a one-time 1 h link is emailed
+  (page: `/account/reset-password.html`). Rate limit: 5/h per IP.
+- `POST /api/auth/password-reset/confirm` — body `{ token, password }`
+  (standard password rules). A successful reset revokes every refresh token on
+  the account.
+
+### TOTP 2FA — `/api/auth/mfa`
+
+- `POST /setup` 🔒 → `{ secret, otpauth_uri }` (RFC 6238, SHA-1/6-digit/30 s —
+  works with any authenticator app). Inactive until confirmed.
+- `POST /enable` 🔒 — body `{ code }` (live TOTP) → enables 2FA, returns
+  `{ backup_codes: [8 single-use codes] }` **exactly once**.
+- `POST /disable` 🔒 — body `{ code }` (TOTP or backup code).
+- `POST /verify` — body `{ mfa_token, code }`. Completes a login that returned
+  `{ mfa_required: true, mfa_token }`. The `mfa_token` lives 5 minutes and is
+  single-use; backup codes are consumed on use.
+
+> With 2FA enabled, `POST /api/auth/login` returns
+> `{ "mfa_required": true, "mfa_token": "<jwt>" }` and **no session tokens**.
+
+### Rate limits & lockout
+
+Credential endpoints (login, register, refresh, confirms, mfa/verify):
+**10 requests / 15 min / IP**. Email-sending endpoints: **5 / h / IP**.
+Server-token exchange: **60 / min / IP**. Global API: 300 / 15 min / IP.
+Additionally, **5 failed logins within 15 minutes lock the account for
+15 minutes** (`429`, even for the correct password).
+
 ---
 
 ## User — `/api/user` 🔒
@@ -122,8 +237,13 @@ Returns the authenticated user's profile joined with their current settings.
     "created_at": "...",
     "display_name": "Peter",
     "avatar_url": "https://example.com/avatar.png",
+    "banner_url": "https://example.com/banner.png",
+    "bio": "Just a person who loves building stuff.",
+    "profile_link": "https://linktr.ee/petersmith",
     "theme": "dark",
     "status": "online",
+    "custom_status": "Working from home 🏠",
+    "custom_status_expires_at": "2026-03-08T18:10:00.000Z",
     "last_seen": "..."
   }
 }
@@ -151,18 +271,34 @@ Explicitly sets the authenticated user’s status.
 
 **Request body**
 
-| Field | Type | Values |
-|-------|------|--------|
-| `status` | string | `online` \| `idle` \| `dnd` \| `invisible` \| `offline` |
+| Field | Type | Rules |
+|-------|------|-------|
+| `status` | string | **Required.** `online` \| `idle` \| `dnd` \| `invisible` \| `offline` |
+| `custom_status` | string | Optional. Max 100 chars. Send `""` to clear. |
+| `custom_status_duration` | string | Optional. How long the custom status lasts. Ignored if `custom_status` is empty. |
+
+**`custom_status_duration` values**
+
+| Value | Duration |
+|-------|----------|
+| `15m` | 15 minutes |
+| `1h` | 1 hour |
+| `8h` | 8 hours |
+| `24h` | 24 hours |
+| `48h` | 48 hours |
+| `3d` | 3 days |
+| `never` | Never expires (default if omitted) |
 
 ```json
-{ "status": "dnd" }
+{ "status": "dnd", "custom_status": "In a meeting", "custom_status_duration": "1h" }
 ```
 
 **`200 OK`**
 ```json
-{ "status": "dnd" }
+{ "status": "dnd", "custom_status": "In a meeting", "custom_status_expires_at": "2026-03-07T21:15:00.000Z" }
 ```
+
+> Expiry is enforced server-side. Once `custom_status_expires_at` is in the past, `custom_status` and `custom_status_expires_at` are returned as `null` — no client action required.
 
 **`400`** Invalid status value · **`401`** Missing/invalid token · **`500`** Server error
 
@@ -191,7 +327,7 @@ Returns the visible status of any user by their UUID.
 
 **`200 OK`**
 ```json
-{ "status": "online", "last_seen": "..." }
+{ "status": "online", "custom_status": "Working from home 🏠", "custom_status_expires_at": "2026-03-08T18:10:00.000Z", "last_seen": "..." }
 ```
 
 **`401`** Missing/invalid token · **`404`** User not found · **`500`** Server error
@@ -212,6 +348,9 @@ Returns the authenticated user's settings.
   "settings": {
     "display_name": "Peter",
     "avatar_url": "https://example.com/avatar.png",
+    "banner_url": "https://example.com/banner.png",
+    "bio": "Just a person who loves building stuff.",
+    "profile_link": "https://linktr.ee/petersmith",
     "theme": "dark",
     "updated_at": "..."
   }
@@ -229,8 +368,13 @@ Updates one or more settings fields. Only sent fields are changed (others are le
 | Field | Type | Rules |
 |-------|------|-------|
 | `display_name` | string | Max 100 chars. |
-| `avatar_url` | string | Must be a valid URL. |
+| `avatar_url` | string | Must be a valid URL. Profile picture. |
+| `banner_url` | string | Must be a valid URL. Profile banner. |
+| `bio` | string | Max 500 chars. |
+| `profile_link` | string | Must be a valid URL. Link shown on the profile (e.g. Linktree, personal site). |
 | `theme` | string | `"dark"` or `"light"`. |
+
+> `custom_status` is updated via `PUT /api/user/status`, not this endpoint.
 
 ```json
 { "display_name": "Peter", "theme": "light" }
@@ -333,13 +477,26 @@ Library: [Socket.io v4](https://socket.io/docs/v4/)
 
 ```js
 const socket = io('https://federation.concordiachat.com', {
-  auth: { token: localStorage.getItem('fed_token') }
+  auth: {
+    token:    localStorage.getItem('fed_token'),
+    platform: 'desktop', // 'desktop' | 'web' | 'mobile_web' — defaults to 'web' if omitted
+  },
 });
 
 socket.on('connect_error', (err) => {
   // err.message: 'Authentication required.' or 'Invalid or expired token.'
 });
 ```
+
+The `platform` field tells the Federation which type of client is connecting. It is used to track live session counts by platform (visible in the admin Metrics tab). Valid values:
+
+| Value | Description |
+|---|---|
+| `desktop` | Concordia desktop application |
+| `web` | Browser web client |
+| `mobile_web` | Mobile browser client |
+
+Unrecognised or missing values default to `web`.
 
 ---
 
@@ -348,6 +505,8 @@ socket.on('connect_error', (err) => {
 #### `ping`
 Sent by the client on its heartbeat interval (recommended: every 25–30 s).  
 The server replies with `heartbeat_ack`. Also call `POST /api/user/heartbeat` on the same interval to update `last_seen` in the database.
+
+If the server stops receiving pings it closes the socket after `pingTimeout` (60 s). Once the user's last socket closes, the Federation waits an 8-second grace period before writing `offline` to the database and emitting `status_change` — this absorbs page reloads and brief network drops without flapping presence.
 
 ```js
 setInterval(() => socket.emit('ping'), 25000);
@@ -370,10 +529,11 @@ Sent in response to a `ping`. Returns the server’s current UTC time so clients
 #### `status_change`
 Room: **presence** (all connected clients)  
 Fired whenever any user calls `PUT /api/user/status` or their status changes.  
-`invisible` users are always emitted as `offline` — the real status is never sent to other clients.
+`invisible` users are always emitted as `offline` — the real status is never sent to other clients.  
+`custom_status` and `custom_status_expires_at` are `null` when the custom status has expired or been cleared.
 
 ```json
-{ "userId": "a3f8c21d-...", "status": "online" }
+{ "userId": "a3f8c21d-...", "status": "online", "custom_status": "Working from home 🏠", "custom_status_expires_at": "2026-03-08T18:10:00.000Z" }
 ```
 
 ---
@@ -383,7 +543,7 @@ Room: **user:\<userId\>** (your sessions only, excluding the socket that trigger
 Fired when `PUT /api/settings` succeeds. All your other open clients should apply these values immediately.
 
 ```json
-{ "display_name": "Peter", "avatar_url": "https://...", "theme": "dark", "updated_at": "..." }
+{ "display_name": "Peter", "avatar_url": "https://...", "banner_url": "https://...", "bio": "...", "profile_link": "https://...", "theme": "dark", "updated_at": "..." }
 ```
 
 ---
@@ -421,9 +581,14 @@ users
 user_settings                                     ← one row per user, globally synced
 ├── user_id        UUID PRIMARY KEY → users.id
 ├── display_name   VARCHAR(100)
-├── avatar_url     VARCHAR(500)
+├── avatar_url     VARCHAR(500)                     ← profile picture
+├── banner_url     VARCHAR(500)                     ← profile banner
+├── bio            VARCHAR(500)
+├── profile_link   VARCHAR(500)
 ├── theme          VARCHAR(20)  DEFAULT 'dark'
 ├── status         VARCHAR(20)  DEFAULT 'offline'  ← online | idle | dnd | invisible | offline
+├── custom_status  VARCHAR(100)                     ← text shown alongside the base status
+├── custom_status_expires_at  TIMESTAMPTZ          ← null = never expires
 ├── last_seen      TIMESTAMPTZ                      ← updated by heartbeat / PUT /status
 └── updated_at     TIMESTAMPTZ  DEFAULT NOW()
 

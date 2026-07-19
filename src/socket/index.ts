@@ -4,9 +4,9 @@ import { verifyFederationToken } from '../middleware/auth';
 import { registerChatHandlers } from './handlers';
 
 export function initializeSocket(io: Server): void {
-  // Verify every Socket.IO connection against the Federation.
-  // Uses the same in-memory token cache as the HTTP middleware, so a user
-  // who just called a REST endpoint will connect instantly without a round-trip.
+  // Verify every Socket.IO connection locally against the Federation JWKS.
+  // The handshake token must be a server-scoped token minted for THIS
+  // server's origin (see middleware/auth.ts) — identity tokens are rejected.
   io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token as string | undefined;
     if (!token) {
