@@ -1,3 +1,8 @@
+> [!CAUTION]
+> **Concordia has reached its end of life (October 2026).**
+>
+> Concordia was a proof of concept for one identity across many self-hosted chat servers. It showed the idea works, and other projects have since done it far better. The hosted app, Federation, Social and chat servers at concordiachat.com have been shut down, and this repository is no longer maintained. The code stays public for reference.
+
 # Concordia Server
 
 Real-time chat server built with **Node.js**, **Socket.IO**, **Express**, and **PostgreSQL**.  
